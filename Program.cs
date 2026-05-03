@@ -167,7 +167,7 @@ class Program
         while (true)
         {
             await Task.Delay(10_000);
-            var cutoff = DateTime.UtcNow.AddSeconds(-15);
+            var cutoff = DateTime.UtcNow.AddSeconds(-60);
             foreach (var (id, lastSeen) in Clients)
             {
                 if (lastSeen < cutoff && Clients.TryRemove(id, out _))
