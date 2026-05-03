@@ -15,6 +15,7 @@ class Program
 
     // Підключені клієнти: clientId -> час останнього запиту
     static readonly ConcurrentDictionary<string, DateTime> Clients = new();
+    static readonly ConcurrentDictionary<string, ConcurrentQueue<ChatMessage>> ClientQueues = new();
 
     static async Task Main()
     {
@@ -55,7 +56,7 @@ class Program
             if (req.HttpMethod == "POST" && path == "/connect") await HandleConnect(req, res);
             else if (req.HttpMethod == "POST" && path == "/disconnect") await HandleDisconnect(req, res);
             else if (req.HttpMethod == "POST" && path == "/send") await HandleSend(req, res);
-            else if (req.HttpMethod == "GET" && path == "/poll") await HandlePoll(req, res);
+            else if (req.HttpMethod == "GET" && path == "/events") await HandleEvents(req, res);
             else
             {
                 res.StatusCode = 404;
@@ -133,33 +134,51 @@ class Program
 
     // GET /poll?clientId=abc&from=5
     // Повертає всі повідомлення починаючи з індексу from
-    static async Task HandlePoll(HttpListenerRequest req, HttpListenerResponse res)
+   static async Task HandleEvents(HttpListenerRequest req, HttpListenerResponse res)
+{
+    string? clientId = req.QueryString["clientId"];
+
+    if (string.IsNullOrWhiteSpace(clientId) || !Clients.ContainsKey(clientId))
     {
-        string? clientId = req.QueryString["clientId"];
-        string? fromStr = req.QueryString["from"];
-
-        if (string.IsNullOrWhiteSpace(clientId) || !Clients.ContainsKey(clientId))
-        {
-            res.StatusCode = 403;
-            await WriteJson(res, new { error = "Невідомий клієнт" });
-            return;
-        }
-
-        Clients[clientId] = DateTime.UtcNow;
-
-        int from = int.TryParse(fromStr, out int f) ? f : 0;
-
-        List<ChatMessage> newMessages;
-        int nextFrom;
-        lock (MessagesLock)
-        {
-            from = Math.Max(0, Math.Min(from, Messages.Count));
-            newMessages = Messages.GetRange(from, Messages.Count - from);
-            nextFrom = Messages.Count;
-        }
-
-        await WriteJson(res, new { messages = newMessages, nextFrom });
+        res.StatusCode = 403;
+        await WriteJson(res, new { error = "Невідомий клієнт" });
+        return;
     }
+
+    res.ContentType = "text/event-stream";
+    res.Headers.Add("Cache-Control", "no-cache");
+    res.Headers.Add("X-Accel-Buffering", "no");
+
+    Clients[clientId] = DateTime.UtcNow;
+
+    // Give this client its own queue
+    var queue = new System.Collections.Concurrent.ConcurrentQueue<ChatMessage>();
+    ClientQueues[clientId] = queue;
+
+    try
+    {
+        while (true)
+        {
+            while (queue.TryDequeue(out var msg))
+            {
+                var json = JsonSerializer.Serialize(msg);
+                var bytes = Encoding.UTF8.GetBytes($"data: {json}\n\n");
+                await res.OutputStream.WriteAsync(bytes);
+                await res.OutputStream.FlushAsync();
+                Clients[clientId] = DateTime.UtcNow;
+            }
+            await Task.Delay(200);
+        }
+    }
+    catch
+    {
+        // Client disconnected
+    }
+    finally
+    {
+        ClientQueues.TryRemove(clientId, out _);
+    }
+}
 
     // Прибираємо клієнтів, які не опитували сервер довше 15 секунд
     static async Task CleanupLoop()
@@ -182,14 +201,16 @@ class Program
 
     static void AddMessage(string clientId, string text)
     {
-        lock (MessagesLock)
-            Messages.Add(new ChatMessage { From = clientId, Text = text, IsSystem = false });
+        var msg = new ChatMessage { From = clientId, Text = text, IsSystem = false };
+        lock (MessagesLock) Messages.Add(msg);
+        foreach (var q in ClientQueues.Values) q.Enqueue(msg);
     }
 
     static void AddSystemMessage(string text)
     {
-        lock (MessagesLock)
-            Messages.Add(new ChatMessage { From = "server", Text = text, IsSystem = true });
+        var msg = new ChatMessage { From = "server", Text = text, IsSystem = true };
+        lock (MessagesLock) Messages.Add(msg);
+        foreach (var q in ClientQueues.Values) q.Enqueue(msg);
     }
 
     static async Task WriteJson(HttpListenerResponse res, object obj)
