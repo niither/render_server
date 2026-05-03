@@ -199,13 +199,13 @@ class Program
         }
     }
 
-    static void AddMessage(string clientId, string text)
+   static void AddMessage(string clientId, string text)
     {
         var msg = new ChatMessage { From = clientId, Text = text, IsSystem = false };
         lock (MessagesLock) Messages.Add(msg);
-        foreach (var q in ClientQueues.Values) q.Enqueue(msg);
+        foreach (var (id, q) in ClientQueues)
+            if (id != clientId) q.Enqueue(msg);
     }
-
     static void AddSystemMessage(string text)
     {
         var msg = new ChatMessage { From = "server", Text = text, IsSystem = true };
